@@ -1,0 +1,191 @@
+name: "CI/CD"
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: us-east-1
+  PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+  PUBLIC_KEY: ${{ secrets.PUBLIC_KEY }}
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ./terraform
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    outputs:
+      server_public_ip: ${{ steps.set-ip.outputs.server_public_ip }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -check
+
+      - name: Terraform Init
+        id: init
+        run: >-
+          terraform init
+          -backend-config="bucket=${{ secrets.TF_STATE_BUCKET_NAME }}"
+          -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: >-
+          terraform plan -input=false -no-color
+          -var="key_name=${{ secrets.KEY_NAME }}"
+          -var="public_key=${{ env.PUBLIC_KEY }}"
+          -var="private_key=${{ env.PRIVATE_KEY }}"
+          -out=tfplan
+
+      - name: Terraform Show
+        if: github.event_name == 'pull_request'
+        run: terraform show -no-color tf.plan 2>&1 > /tmp/plan.txt
+
+      - name: Update Pull Request
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require("fs");
+            const plan = fs.readFileSync("/tmp/plan.txt", "utf8");
+            const maxGitHubBodyCharacters = 65536;
+
+            function chunkSubstr(str, size) {
+              const numChunks = Math.ceil(str.length / size)
+              const chunks = new Array(numChunks)
+              for (let i = 0, o = 0; i < numChunks; ++i, o += size) {
+                chunks[i] = str.substr(o, size)
+              }
+              return chunks
+            }
+
+            // Split the Terraform plan into chunks if it's too big and can't fit into the GitHub Action
+            var plans = chunkSubstr(plan, maxGitHubBodyCharacters);
+            for (let i = 0; i < plans.length; i++) {
+              const output = `### ${{ inputs.plan-title }} Part # ${i + 1}
+              #### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+              #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+              #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+              <details><summary>Show Plan</summary>
+              \`\`\`\n
+              ${plans[i]}
+              \`\`\`
+              </details>
+              *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ inputs.working-directory }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              });
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve -input=false tfplan
+
+      - name: Set IP Address
+        id: set-ip
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: echo "server_public_ip=$(terraform output -raw server_public_ip)" >> $GITHUB_OUTPUT
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    env:
+      IMAGE_TAG: ${{ github.sha }}
+      REGISTRY_ALIAS: v7g0h6j7
+      REPOSITORY: ${{ github.event.repository.name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        with:
+          registry-type: public
+
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t ${{ env.REGISTRY }}/${{ env.REGISTRY_ALIAS }}/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }} .
+          docker push ${{ env.REGISTRY }}/${{ env.REGISTRY_ALIAS }}/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }}
+        working-directory: ./api
+
+      - name: Deploy Docker image to Amazon ECS
+        env:
+          MONGO_DB_API_KEY: ${{ secrets.MONGO_DB_API_KEY }}
+          MONGO_DB_CLUSTER_NAME: ${{ secrets.MONGO_DB_CLUSTER_NAME }}
+          MONGO_DB_COLLECTION_NAME: ${{ secrets.MONGO_DB_COLLECTION_NAME }}
+          MONGO_DB_DATABASE_NAME: ${{ secrets.MONGO_DB_DATABASE_NAME }}
+          MONGO_DB_URL: ${{ secrets.MONGO_DB_URL }}
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          SERVER_PUBLIC_IP: ${{ needs.terraform.outputs.server_public_ip }}
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ env.SERVER_PUBLIC_IP }}
+          username: ubuntu
+          key: ${{ env.PRIVATE_KEY }}
+          envs: >-
+            AWS_ACCESS_KEY_ID,
+            AWS_SECRET_ACCESS_KEY,
+            AWS_REGION,
+            IMAGE_TAG,
+            MONGO_DB_API_KEY,
+            MONGO_DB_CLUSTER_NAME,
+            MONGO_DB_COLLECTION_NAME,
+            MONGO_DB_DATABASE_NAME,
+            MONGO_DB_URL,
+            PRIVATE_KEY,
+            REGISTRY,
+            REGISTRY_ALIAS,
+            REPOSITORY
+          script: |
+            sudo apt-get update
+            sudo apt-get install -y awscli docker.io
+            sudo $(aws ecr get-login --no-include-email --region $AWS_REGION)
+            sudo docker stop $REPOSITORY || true
+            sudo docker rm $REPOSITORY || true
+            sudo docker run -d --name $REPOSITORY \
+              -e MONGO_DB_API_KEY=$MONGO_DB_API_KEY \
+              -e MONGO_DB_CLUSTER_NAME=$MONGO_DB_CLUSTER_NAME \
+              -e MONGO_DB_COLLECTION_NAME=$MONGO_DB_COLLECTION_NAME \
+              -e MONGO_DB_DATABASE_NAME=$MONGO_DB_DATABASE_NAME \
+              -e MONGO_DB_URL=$MONGO_DB_URL \
+              -p 80:8080 \
+              $REGISTRY/$REGISTRY_ALIAS/$REPOSITORY:$IMAGE_TAG
