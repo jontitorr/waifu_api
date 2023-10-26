@@ -8,16 +8,7 @@ project(
 
 option(${PROJECT_NAME}_INSTALL "Generate the install target" ON)
 
-if(NOT EXISTS "${CMAKE_BINARY_DIR}/CPM.cmake")
-    file(
-        DOWNLOAD
-        "https://github.com/cpm-cmake/CPM.cmake/releases/latest/download/get_cpm.cmake"
-        "${CMAKE_BINARY_DIR}/CPM.cmake"
-        TLS_VERIFY ON
-    )
-endif()
-
-include(${CMAKE_BINARY_DIR}/CPM.cmake)
+include(cmake/CPM.cmake)
 
 cpmfindpackage(NAME "net" GITHUB_REPOSITORY "Xminent/net" GIT_TAG "main")
 

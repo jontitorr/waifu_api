@@ -1,0 +1,34 @@
+FROM ubuntu:20.04 AS build
+
+WORKDIR /waifu_api
+
+COPY cmake/ ./cmake/
+COPY src/ ./src/
+COPY CMakeLists.txt .
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    libssl-dev \
+    && cmake -S . -B build && cmake --build build --config Release
+
+FROM ubuntu:20.04
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl-dev \
+    && addgroup --system nonroot && adduser --system nonroot --ingroup nonroot
+
+USER nonroot
+
+WORKDIR /app
+
+COPY --from=build /waifu_api/build/_deps/net-build/libnet.so /usr/lib/
+COPY --from=build --chown=nonroot:nonroot /waifu_api/build/waifu_api .
+
+EXPOSE 8080
+
+ENTRYPOINT ["./waifu_api"]
